@@ -1,0 +1,22 @@
+Native Windows Support
+======================
+
+What it means:
+--------------
+
+1. Using native Windows system commands to perform relevant file system operations.
+2. Compiling port drivers and NIFs using (modern) Microsoft compilers.
+3. X.
+4. Y.
+ 
+
+Current state:
+--------------
+
+Initial versions of 1 and 2 are implemented.
+
+
+Notes:
+------
+
+1. The current use of environment variables in rebar is unsafe and has various negative side effects.
