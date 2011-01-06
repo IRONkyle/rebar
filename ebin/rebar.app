@@ -1,5 +1,5 @@
 {application, rebar,
- [{description, "Rebar: Erlang Build Tool"},
+ [{description, "Rebar: Erlang Build Tool (with native Windows support)"},
   {vsn, "2"},
   {modules, [ rebar,
               rebar_abnfc_compiler,

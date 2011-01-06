@@ -103,9 +103,23 @@ compile_each([{Proto, Beam, Hrl} | Rest]) ->
                     %% Compilation worked, but we need to move the .beam and .hrl file
                     %% into the ebin/ and include/ directories respectively
                     %% TODO: Protobuffs really needs to be better about this...sigh.
-                    [] = os:cmd(?FMT("mv ~s ebin", [Beam])),
-                    ok = filelib:ensure_dir(filename:join("include", Hrl)),
-                    [] = os:cmd(?FMT("mv ~s include", [Hrl])),
+
+					%% KCQ NOTE: 
+					%% select os specific move command (todo: needs to be abstracted)
+					%% Windows 'move' command also returns a message (unlike unix 'mv'):
+					%% "\t1 file(s) moved.\r\n"
+					case os:type() of
+						{win32,_} -> 
+							MvCmd = "move /Y",
+							_MvOutBeam = os:cmd(?FMT("~s ~s ebin", [MvCmd, Beam])),
+                            ok = filelib:ensure_dir(filename:join("include", Hrl)),
+                            _MvOutHrl = os:cmd(?FMT("~s ~s include", [MvCmd, Hrl]));
+						_ -> 
+							MvCmd = "mv",
+							[] = os:cmd(?FMT("~s ~s ebin", [MvCmd, Beam])),
+                            ok = filelib:ensure_dir(filename:join("include", Hrl)),
+                            [] = os:cmd(?FMT("~s ~s include", [MvCmd, Hrl]))
+					end,					
                     ok;
                 Other ->
                     ?ERROR("Protobuff compile of ~s failed: ~p\n", [Proto, Other]),

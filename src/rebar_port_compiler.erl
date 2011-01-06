@@ -80,36 +80,25 @@ compile(Config, AppFile) ->
     case Sources of
         [] ->
             ok;
-        _ ->
-            %% Extract environment values from the config (if specified) and merge with the
-            %% default for this operating system. This enables max flexibility for users.
-            DefaultEnvs  = filter_envs(default_env(), []),
+        _ ->	
+		    %% Extract environment values from the config (if specified) and merge with the
+            %% default for this operating system. This enables max flexibility for users.			
+            DefaultEnvs = filter_envs(default_env(), []),
             OverrideEnvs = filter_envs(rebar_config:get_list(Config, port_envs, []), []),
-            Env = expand_vars_loop(merge_each_var(DefaultEnvs ++ OverrideEnvs ++ os_env(), [])),
+			BuildEnv = expand_vars_loop(merge_each_var(DefaultEnvs ++ OverrideEnvs, [])),
+			OsEnv = os_env(),
+            FullEnv = expand_vars_loop(merge_each_var(BuildEnv ++ OsEnv, [])),
 
-            %% One or more files are available for building. Run the pre-compile hook, if
-            %% necessary.
-            run_precompile_hook(Config, Env),
-
-            %% Compile each of the sources
-            {NewBins, ExistingBins} = compile_each(Sources, Config, Env, [], []),
-
-            %% Construct the driver name and make sure priv/ exists
-            SoSpecs = so_specs(Config, AppFile, NewBins ++ ExistingBins),
-            ?INFO("Using specs ~p\n", [SoSpecs]),
-            lists:foreach(fun({SoName,_}) -> ok = filelib:ensure_dir(SoName) end, SoSpecs),
-
-            %% Only relink if necessary, given the SoName and list of new binaries
-            lists:foreach(fun({SoName,Bins}) ->
-                case needs_link(SoName, sets:to_list(sets:intersection([sets:from_list(Bins),sets:from_list(NewBins)]))) of
-                  true ->
-                    rebar_utils:sh_failfast(?FMT("$CC ~s $LDFLAGS $DRV_LDFLAGS -o ~s",
-                                                  [string:join(Bins, " "), SoName]), Env);
-                  false ->
-                    ?INFO("Skipping relink of ~s\n", [SoName]),
-                    ok
-                end
-              end, SoSpecs)
+			%% KCQ NOTE: 
+			%% Even though passing build flags is a convinient trick to pass data to spawned code
+			%% it can and it does have very unpredictable side effects because 
+			%% the env and build vars don't always mix well
+			case get_build_env_value("REBAR_PORT_USE_ENV",BuildEnv,"true") of
+                "false" ->
+                    compile_no_env(Config,AppFile,Sources,BuildEnv,OsEnv);
+                _ ->
+                    compile_with_env(Config,AppFile,Sources,FullEnv)
+            end
     end.
 
 clean(Config, AppFile) ->
@@ -130,15 +119,92 @@ clean(Config, AppFile) ->
 %% Internal functions
 %% ===================================================================
 
+get_build_env_value(Key, List,ValDefault) ->
+   case lists:keyfind(Key, 1, List) of
+      {_K, V} -> V;
+      false -> ValDefault
+   end.
+
+compile_no_env(Config,AppFile,Sources,BuildEnv,Env) ->
+    %% One or more files are available for building. Run the pre-compile hook, if
+    %% necessary.
+    run_precompile_hook(Config, Env),
+
+	CcVal = get_build_env_value("CC",BuildEnv,"cl"),	
+	CxxVal = get_build_env_value("CXX",BuildEnv,"cl"),
+	CflagsVal = get_build_env_value("CFLAGS",BuildEnv,"/MD"),
+	CxxflagsVal = get_build_env_value("CXXFLAGS",BuildEnv,"/MD"),
+	DrvcflagsVal = get_build_env_value("DRV_CFLAGS",BuildEnv,""),
+	LdflagsVal = get_build_env_value("LDFLAGS",BuildEnv,"/LD"),
+	DrvldflagsVal = get_build_env_value("DRV_LDFLAGS",BuildEnv,""),	
+ 
+    %% Compile each of the sources
+    {NewBins, ExistingBins} = compile_each_no_env(Sources, Config, Env, [], [],CcVal,CxxVal,CflagsVal,CxxflagsVal,DrvcflagsVal),
+
+    %% Construct the driver name and make sure priv/ exists
+    SoSpecs = so_specs(Config, AppFile, NewBins ++ ExistingBins),
+    ?INFO("Using specs ~p\n", [SoSpecs]),
+    lists:foreach(fun({SoName,_}) -> ok = filelib:ensure_dir(SoName) end, SoSpecs),
+
+	%% KCQ: probably good idea to have an explicit linker variable ($LD = link.exe, but CL will do linking too )
+    %% Only relink if necessary, given the SoName and list of new binaries
+    lists:foreach(fun({SoName,Bins}) ->
+        case needs_link(SoName, sets:to_list(sets:intersection([sets:from_list(Bins),sets:from_list(NewBins)]))) of
+          true ->
+		  	case os:type() of	
+			  {win32, nt} ->						
+                rebar_utils:sh_failfast(?FMT("~s /Fe~s ~s ~s ~s",
+                                                  [CcVal, SoName, string:join(Bins, " "),LdflagsVal,DrvldflagsVal]), Env);
+			  _ ->
+                rebar_utils:sh_failfast(?FMT("~s ~s ~s ~s -o ~s",
+                                                  [CcVal, string:join(Bins, " "),LdflagsVal,DrvldflagsVal, SoName]), Env)
+            end;
+          false ->
+            ?INFO("Skipping relink of ~s\n", [SoName]),
+            ok
+        end
+    end, SoSpecs).	
+	
+	
+compile_with_env(Config,AppFile,Sources,Env) ->
+    %% One or more files are available for building. Run the pre-compile hook, if
+    %% necessary.
+    run_precompile_hook(Config, Env),
+
+    %% Compile each of the sources
+    {NewBins, ExistingBins} = compile_each(Sources, Config, Env, [], []),
+
+    %% Construct the driver name and make sure priv/ exists
+    SoSpecs = so_specs(Config, AppFile, NewBins ++ ExistingBins),
+    ?INFO("Using specs ~p\n", [SoSpecs]),
+    lists:foreach(fun({SoName,_}) -> ok = filelib:ensure_dir(SoName) end, SoSpecs),
+
+    %% Only relink if necessary, given the SoName and list of new binaries
+    lists:foreach(fun({SoName,Bins}) ->
+        case needs_link(SoName, sets:to_list(sets:intersection([sets:from_list(Bins),sets:from_list(NewBins)]))) of
+          true ->
+            rebar_utils:sh_failfast(?FMT("$CC ~s $LDFLAGS $DRV_LDFLAGS -o ~s",
+                                                  [string:join(Bins, " "), SoName]), Env);
+          false ->
+            ?INFO("Skipping relink of ~s\n", [SoName]),
+            ok
+        end
+    end, SoSpecs).   
+   
 expand_sources([], Acc) ->
     Acc;
 expand_sources([Spec | Rest], Acc) ->
     Acc2 = filelib:wildcard(Spec) ++ Acc,
     expand_sources(Rest, Acc2).
-    
+    	 
+%% KCQ NOTE: use win obj on windows	
 expand_objects(Sources) ->
-    [filename:join([filename:dirname(F), filename:basename(F) ++ ".o"])
-     || F <- Sources].
+    case os:type() of
+        {win32, nt} -> ObjExt = ".obj";
+        _ -> ObjExt = ".o"
+    end,
+    [filename:join([filename:dirname(F), filename:basename(F) ++ ObjExt])
+     || F <- Sources].	 
 
 run_precompile_hook(Config, Env) ->
     case rebar_config:get(Config, port_pre_script, undefined) of
@@ -168,14 +234,25 @@ compile_each([], _Config, _Env, NewBins, ExistingBins) ->
     {lists:reverse(NewBins), lists:reverse(ExistingBins)};
 compile_each([Source | Rest], Config, Env, NewBins, ExistingBins) ->
     Ext = filename:extension(Source),
-    Bin = filename:rootname(Source, Ext) ++ ".o",
+    %% KCQ NOTE: use win obj on windows	
+    case os:type() of
+        {win32, nt} -> ObjExt = ".obj";
+        _ -> ObjExt = ".o"
+    end,	
+    Bin = filename:rootname(Source, Ext) ++ ObjExt,
     case needs_compile(Source, Bin) of
         true ->
             ?CONSOLE("Compiling ~s\n", [Source]),
             case compiler(Ext) of
-                "$CC" ->
-                    rebar_utils:sh_failfast(?FMT("$CC -c $CFLAGS $DRV_CFLAGS ~s -o ~s",
+                "$CC" ->							 
+				    case os:type() of	
+					    {win32, nt} ->							
+                            rebar_utils:sh_failfast(?FMT("$cl /c ~s /Fo~s",
                                                  [Source, Bin]), Env);
+						_ ->
+                            rebar_utils:sh_failfast(?FMT("$CC -c $CFLAGS $DRV_CFLAGS ~s -o ~s",
+                                                 [Source, Bin]), Env)
+                    end;												 
                 "$CXX" ->
                     rebar_utils:sh_failfast(?FMT("$CXX -c $CXXFLAGS $DRV_CFLAGS ~s -o ~s",
                                                  [Source, Bin]), Env)
@@ -187,7 +264,45 @@ compile_each([Source | Rest], Config, Env, NewBins, ExistingBins) ->
             compile_each(Rest, Config, Env, NewBins, [Bin | ExistingBins])
     end.
 
+compile_each_no_env([], _Config, _Env, NewBins, ExistingBins,_CcVal,_CxxVal,_CflagsVal,_CxxflagsVal,_DrvcflagsVal) ->
+    {lists:reverse(NewBins), lists:reverse(ExistingBins)};
+compile_each_no_env([Source | Rest], Config, Env, NewBins, ExistingBins,CcVal,CxxVal,CflagsVal,CxxflagsVal,DrvcflagsVal) ->
+    Ext = filename:extension(Source),
+    %% KCQ NOTE: use win obj on windows	
+    case os:type() of
+        {win32, nt} -> ObjExt = ".obj";
+        _ -> ObjExt = ".o"
+    end,	
+    Bin = filename:rootname(Source, Ext) ++ ObjExt,
+    case needs_compile(Source, Bin) of
+        true ->
+            ?CONSOLE("[NE] Compiling ~s\n", [Source]),
+            case compiler(Ext) of
+                "$CC" ->
+				    case os:type() of	
+					    {win32, nt} ->						
+                            rebar_utils:sh_failfast(?FMT("~s /c ~s ~s ~s /Fo~s",
+                                                 [CcVal,CflagsVal,DrvcflagsVal, Source, Bin]), Env);
+						_ ->
+                            rebar_utils:sh_failfast(?FMT("~s -c ~s ~s ~s -o ~s",
+                                                 [CcVal,CflagsVal,DrvcflagsVal, Source, Bin]), Env)
+                    end;												 
+                "$CXX" ->
+				    case os:type() of	
+					    {win32, nt} ->						
+                            rebar_utils:sh_failfast(?FMT("~s /c ~s ~s ~s /Fo~s",
+                                                 [CxxVal,CxxflagsVal,DrvcflagsVal, Source, Bin]), Env);
+						_ ->
+                            rebar_utils:sh_failfast(?FMT("~s -c ~s ~s ~s -o ~s",
+                                                 [CxxVal,CxxflagsVal,DrvcflagsVal,Source, Bin]), Env)
+                    end
+            end,
+            compile_each_no_env(Rest, Config, Env, [Bin | NewBins], ExistingBins,CcVal,CxxVal,CflagsVal,CxxflagsVal,DrvcflagsVal);
 
+        false ->
+            ?INFO("Skipping ~s\n", [Source]),
+            compile_each_no_env(Rest, Config, Env, NewBins, [Bin | ExistingBins],CcVal,CxxVal,CflagsVal,CxxflagsVal,DrvcflagsVal)
+    end.
 
 needs_compile(Source, Bin) ->
     %% TODO: Generate depends using gcc -MM so we can also check for include changes
@@ -280,6 +395,9 @@ expand_vars(Key, Value, Vars) ->
 %% Given env. variable FOO we want to expand all references to
 %% it in InStr. References can have two forms: $FOO and ${FOO}
 %%
+%% KCQ NOTE: don't want to do empty var name expansion because then we only replace '$' (with junk)
+expand_env_variable(InStr, [], _VarValue) ->
+    InStr;
 expand_env_variable(InStr, VarName, VarValue) ->
     R1 = re:replace(InStr, "\\\$" ++ VarName, VarValue),
     re:replace(R1, "\\\${" ++ VarName ++ "}", VarValue, [{return, list}]).
@@ -334,14 +452,29 @@ default_env() ->
 
      {"darwin10.*-32", "CFLAGS", "-m32"}, % OS X Snow Leopard flags for 32-bit
      {"darwin10.*-32", "CXXFLAGS", "-m32"},
-     {"darwin10.*-32", "LDFLAGS", "-arch i386"}
+     {"darwin10.*-32", "LDFLAGS", "-arch i386"},
+	 {"win.*", "CC", "cl /nologo"},
+	 {"win.*", "CXX", "cl /nologo"},
+	 {"win.*", "CFLAGS", "/MD"},
+	 {"win.*", "CXXFLAGS", "/MD /EHsc"},
+	 {"win.*", "LDFLAGS", "/LD"},	 
+	 {"win.*","DRV_CFLAGS","$ERL_CFLAGS"},
+	 {"win.*","DRV_LDFLAGS",lists:concat(["/link /LIBPATH:", code:lib_dir(erl_interface, lib),
+                                   " erl_interface_md.lib ei_md.lib"])},
+     {"win.*","DRV_LDF_BASE",lists:concat(["/link /LIBPATH:", code:lib_dir(erl_interface, lib)])},
+     {"win.*","REBAR_PORT_BUILDER", "guess"},
+     {"win.*","REBAR_PORT_USE_ENV", "false"}	 
     ].
 
 
 
+%% KCQ NOTE: use win obj on windows
 source_to_bin(Source) ->
     Ext = filename:extension(Source),
-    filename:rootname(Source, Ext) ++ ".o".
+    case os:type() of	
+        {win32, nt} -> filename:rootname(Source, Ext) ++ ".obj";
+        _ -> filename:rootname(Source, Ext) ++ ".o"
+    end.
 
 so_specs(Config, AppFile, Bins) ->
     Specs = make_so_specs(Config, AppFile, Bins),
